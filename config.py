@@ -36,3 +36,5 @@ with open("config.yaml", "rb") as reader:
 
     ### 是否使用夜神模拟器
     use_monitor = config["use_monitor"]
+    vm_name = config["vm_name"]
+    hot_key = config["hot_key"]

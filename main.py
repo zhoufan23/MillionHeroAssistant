@@ -11,6 +11,9 @@ import multiprocessing
 import operator
 import os
 import time
+import win32gui
+
+from pyhooked import Hook, KeyboardEvent
 from argparse import ArgumentParser
 from datetime import datetime
 from functools import partial
@@ -30,14 +33,25 @@ from config import enable_chrome
 from config import image_compress_level
 from config import prefer
 from config import use_monitor
-from core.android import analyze_current_screen_text, get_adb_tool, check_screenshot
+from config import vm_name
+from config import hot_key
+
+# from core.android import analyze_current_screen_text, get_adb_tool, check_screenshot
+from core.windows import analyze_current_screen_text
 from core.android import save_screen
 from core.check_words import parse_false
 from core.chrome_search import run_browser
 from core.crawler.baiduzhidao import baidu_count
-from core.crawler.crawl import jieba_initialize, kwquery
+from core.crawler.crawl import jieba_initialize, kwquery, crawler_daemon
 from core.ocr.baiduocr import get_text_from_image as bai_get_text
 from core.ocr.spaceocr import get_text_from_image as ocrspace_get_text
+
+crawler_noticer = Event()
+crawler_noticer.clear()
+result_noticer = Event()
+result_noticer.clear()
+qreader, qwriter = Pipe()
+stdreader, stdwriter = Pipe()
 
 ## jieba init
 jieba_initialize()
@@ -101,29 +115,109 @@ def pre_process_question(keyword):
     return keyword
 
 
+def __inner_job():
+    start = time.time()
+    # text_binary = analyze_current_screen_text(
+    #     directory=data_directory,
+    #     compress_level=image_compress_level[0],
+    #     crop_area=crop_areas[game_type],
+    #     use_monitor=use_monitor
+    # )
+    text_binary = analyze_current_screen_text(
+        vm_name,
+        directory=data_directory
+    )
+    keywords = get_text_from_image(
+        image_data=text_binary,
+    )
+    if not keywords:
+        print("text not recognize")
+        return
+
+    true_flag, real_question, question, answers = parse_question_and_answer(
+        keywords)
+
+    # notice crawler to work
+    qwriter.send(real_question.strip("?"))
+    crawler_noticer.set()
+
+    print('-' * 72)
+    print(real_question)
+    print('-' * 72)
+    print("\n".join(answers))
+
+    # notice browser
+    if enable_chrome:
+        writer.send(question)
+        noticer.set()
+
+    search_question = pre_process_question(question)
+    summary = baidu_count(search_question, answers, timeout=timeout)
+    summary_li = sorted(
+        summary.items(), key=operator.itemgetter(1), reverse=True)
+    data = [("选项", "同比")]
+    for a, w in summary_li:
+        data.append((a, w))
+    table = AsciiTable(data)
+    print(table.table)
+
+    print("*" * 72)
+    if true_flag:
+        print("肯定回答(**)： ", summary_li[0][0])
+        print("否定回答(  )： ", summary_li[-1][0])
+    else:
+        print("肯定回答(  )： ", summary_li[0][0])
+        print("否定回答(**)： ", summary_li[-1][0])
+    print("*" * 72)
+
+    # try crawler
+    retry = 4
+    while retry:
+        if result_noticer.is_set():
+            print("~" * 60)
+            print(stdreader.recv())
+            print("~" * 60)
+            break
+        retry -= 1
+        time.sleep(1)
+    result_noticer.clear()
+
+    print("~" * 60)
+    print(kwquery(real_question.strip("?")))
+    print("~" * 60)
+
+    end = time.time()
+    print("use {0} 秒".format(end - start))
+    save_screen(
+        directory=data_directory
+    )
+
+def handle_events(args):
+    if isinstance(args, KeyboardEvent):
+        print args.current_key
+        if args.current_key == hot_key and args.event_type == 'key down':
+            __inner_job()
+        elif args.current_key == 'Q' and args.event_type == 'key down':
+            hk.stop()
+            print('退出啦~')
+
 def main():
     args = parse_args()
     timeout = args.timeout
 
-    ## start crawler
-    # crawler_noticer = Event()
-    # crawler_noticer.clear()
-    # result_noticer = Event()
-    # result_noticer.clear()
-    # qreader, qwriter = Pipe()
-    # stdreader, stdwriter = Pipe()
-    # crawler = multiprocessing.Process(
-    #     target=crawler_daemon,
-    #     args=(crawler_noticer, qreader, result_noticer, stdwriter)
-    # )
-    # crawler.daemon = True
-    # crawler.start()
+    # start crawler
+    crawler = multiprocessing.Process(
+        target=crawler_daemon,
+        args=(crawler_noticer, qreader, result_noticer, stdwriter)
+    )
+    crawler.daemon = True
+    crawler.start()
 
-    adb_bin = get_adb_tool()
-    if use_monitor:
-        os.system("{0} connect 127.0.0.1:62001".format(adb_bin))
-
-    check_screenshot(filename="screenshot.png", directory=data_directory)
+    # adb_bin = get_adb_tool()
+    # if use_monitor:
+    #     os.system("{0} connect 127.0.0.1:62001".format(adb_bin))
+    #
+    # check_screenshot(filename="screenshot.png", directory=data_directory)
 
     if enable_chrome:
         closer = Event()
@@ -136,109 +230,15 @@ def main():
         browser_daemon.daemon = True
         browser_daemon.start()
 
-    def __inner_job():
-        start = time.time()
-        text_binary = analyze_current_screen_text(
-            directory=data_directory,
-            compress_level=image_compress_level[0],
-            crop_area=crop_areas[game_type],
-            use_monitor=use_monitor
-        )
-        keywords = get_text_from_image(
-            image_data=text_binary,
-        )
-        if not keywords:
-            print("text not recognize")
-            return
-
-        true_flag, real_question, question, answers = parse_question_and_answer(
-            keywords)
-
-        ## notice crawler to work
-        # qwriter.send(real_question.strip("?"))
-        # crawler_noticer.set()
-
-        print('-' * 72)
-        print(real_question)
-        print('-' * 72)
-        print("\n".join(answers))
-
-        # notice browser
-        if enable_chrome:
-            writer.send(question)
-            noticer.set()
-
-        search_question = pre_process_question(question)
-        summary = baidu_count(search_question, answers, timeout=timeout)
-        summary_li = sorted(
-            summary.items(), key=operator.itemgetter(1), reverse=True)
-        data = [("选项", "同比")]
-        for a, w in summary_li:
-            data.append((a, w))
-        table = AsciiTable(data)
-        print(table.table)
-
-        print("*" * 72)
-        if true_flag:
-            print("肯定回答(**)： ", summary_li[0][0])
-            print("否定回答(  )： ", summary_li[-1][0])
-        else:
-            print("肯定回答(  )： ", summary_li[0][0])
-            print("否定回答(**)： ", summary_li[-1][0])
-        print("*" * 72)
-
-        # try crawler
-        # retry = 4
-        # while retry:
-        #     if result_noticer.is_set():
-        #         print("~" * 60)
-        #         print(stdreader.recv())
-        #         print("~" * 60)
-        #         break
-        #     retry -= 1
-        #     time.sleep(1)
-        # result_noticer.clear()
-
-        print("~" * 60)
-        print(kwquery(real_question.strip("?")))
-        print("~" * 60)
-
-        end = time.time()
-        print("use {0} 秒".format(end - start))
-        save_screen(
-            directory=data_directory
-        )
-
-    print("""
-    请选择答题节目:
-      1. 百万英雄
-      2. 冲顶大会
-    """)
-    game_type = input("输入节目序号: ")
-    if game_type == "1":
-        game_type = '百万英雄'
-    elif game_type == "2":
-        game_type = '冲顶大会'
+    hld = win32gui.FindWindow(None, vm_name)
+    if hld > 0:
+        print('使用前记得去config.ini把配置改好哦~~,主要是自己申请换key,不然次数很快就用完啦~~\n\n用模拟器打开对应应用~~\n题目出现的时候按F2，我就自动帮你去搜啦~\n')
+        hk = Hook()
+        hk.handler = handle_events
+        hk.hook()
     else:
-        game_type = '百万英雄'
+        print('咦，你没打开' + vm_name + '吧!请打开' + vm_name + '并重启下start.bat')
 
-    while True:
-        print("""
-    请在答题开始前就运行程序，
-    答题开始的时候按Enter预测答案
-                """)
-
-        print("当前选择答题游戏: {}\n".format(game_type))
-
-        enter = input("按Enter键开始，按ESC键退出...")
-        if enter == chr(27):
-            break
-        try:
-            __inner_job()
-        except Exception as e:
-            print(str(e))
-
-        print("欢迎下次使用")
 
     if enable_chrome:
         reader.close()
